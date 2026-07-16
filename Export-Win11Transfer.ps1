@@ -28,7 +28,11 @@
 [CmdletBinding()]
 param(
     # Which Chromium browsers to look for. Add to this list for anything else in use.
-    [string[]]$ChromiumBrowsers = @('Chrome', 'Edge', 'Opera', 'OperaGX', 'Brave', 'Vivaldi')
+    [string[]]$ChromiumBrowsers = @('Chrome', 'Edge', 'Opera', 'OperaGX', 'Brave', 'Vivaldi'),
+
+    # Base pacing (ms) for typing each password page's URL into the address bar. Raise this on
+    # older/slower machines where the browser window takes longer to render - e.g. -NavigationDelayMs 2500.
+    [int]$NavigationDelayMs = 1200
 )
 
 $ErrorActionPreference = 'Continue'
@@ -70,17 +74,13 @@ $uninstallPaths = @(
 $apps = foreach ($path in $uninstallPaths) {
     Get-ItemProperty -Path $path -ErrorAction SilentlyContinue |
         Where-Object { $_.DisplayName } |
-        Select-Object @{n='Name';e={$_.DisplayName}},
-                      @{n='Version';e={$_.DisplayVersion}},
-                      Publisher,
-                      InstallDate,
-                      @{n='UninstallString';e={$_.UninstallString}}
+        Select-Object @{n='Name';e={$_.DisplayName}}
 }
 $apps | Sort-Object Name -Unique | Export-Csv -Path (Join-Path $Reports 'InstalledApplications.csv') -NoTypeInformation -Encoding UTF8
 Write-Log ("  -> {0} desktop applications found" -f ($apps | Measure-Object).Count)
 
 try {
-    Get-AppxPackage | Select-Object Name, PackageFullName, Version, Publisher |
+    Get-AppxPackage | Select-Object Name -Unique |
         Export-Csv -Path (Join-Path $Reports 'InstalledApps_UWP.csv') -NoTypeInformation -Encoding UTF8
     Write-Log "  -> UWP/Store app list exported"
 } catch {
@@ -295,35 +295,208 @@ Write-Log "Starting guided password export..."
 
 Add-Type -AssemblyName System.Windows.Forms | Out-Null
 
+# Get-Command only checks $env:PATH, which most browsers (Firefox especially) are never added
+# to - this reads the same "App Paths" registry key Windows itself uses to resolve a bare exe
+# name, so detection/launch works regardless of PATH.
+function Get-BrowserExePath {
+    param([string]$ExeName)
+    $regPaths = @(
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\$ExeName",
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\$ExeName",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\$ExeName"
+    )
+    foreach ($regPath in $regPaths) {
+        $value = (Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue).'(default)'
+        if ($value -and (Test-Path $value)) { return $value }
+    }
+    $cmd = Get-Command $ExeName -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    return $null
+}
+
+Add-Type -Language CSharp -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class Win11TransferWin32 {
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    [DllImport("user32.dll")]
+    public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")]
+    public static extern bool IsWindow(IntPtr hWnd);
+    [DllImport("kernel32.dll")]
+    public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")]
+    public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+}
+"@
+
+# Plain SetForegroundWindow is frequently ignored by Windows for background/non-interactive
+# processes (the OS's anti focus-stealing protection). Two workarounds combined: an Alt key tap
+# (resets the lock Windows uses to decide whether a foreground-switch is "user-initiated"), and
+# attaching this thread's input queue to the target window's thread.
+function Set-ForegroundWindowRobust {
+    param([IntPtr]$Hwnd)
+    if ($Hwnd -eq [IntPtr]::Zero -or -not [Win11TransferWin32]::IsWindow($Hwnd)) { return $false }
+
+    [Win11TransferWin32]::ShowWindow($Hwnd, 9) | Out-Null  # SW_RESTORE, in case it's minimized
+    $foreground = [Win11TransferWin32]::GetForegroundWindow()
+    if ($foreground -eq $Hwnd) { return $true }
+
+    # Alt key tap (key down, key up) - VK_MENU = 0x12, KEYEVENTF_KEYUP = 0x0002.
+    [Win11TransferWin32]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+    [Win11TransferWin32]::keybd_event(0x12, 0, 0x0002, [UIntPtr]::Zero)
+
+    $currentThreadId = [Win11TransferWin32]::GetCurrentThreadId()
+    [uint32]$foregroundProcessId = 0
+    $foregroundThreadId = [Win11TransferWin32]::GetWindowThreadProcessId($foreground, [ref]$foregroundProcessId)
+
+    $attached = $false
+    if ($foregroundThreadId -ne 0 -and $foregroundThreadId -ne $currentThreadId) {
+        $attached = [Win11TransferWin32]::AttachThreadInput($currentThreadId, $foregroundThreadId, $true)
+    }
+    try {
+        [Win11TransferWin32]::SetForegroundWindow($Hwnd) | Out-Null
+    } finally {
+        if ($attached) {
+            [Win11TransferWin32]::AttachThreadInput($currentThreadId, $foregroundThreadId, $false) | Out-Null
+        }
+    }
+    Start-Sleep -Milliseconds 200
+    return ([Win11TransferWin32]::GetForegroundWindow() -eq $Hwnd)
+}
+
+# Chromium browsers are single-instance: if one was already running, the process Start-Process
+# just launched hands its arguments to the existing instance over IPC and exits within a second
+# or two - it never owns a window. So instead of trusting that one PID, this searches every
+# process with the browser's exe name for whichever one currently owns a visible main window.
+function Find-BrowserWindow {
+    param([string]$ExeBaseName, [int]$LauncherProcessId, [int]$TimeoutSeconds = 30)
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $candidates = @()
+        try {
+            $launcher = Get-Process -Id $LauncherProcessId -ErrorAction SilentlyContinue
+            if ($launcher -and -not $launcher.HasExited) { $candidates += $launcher }
+        } catch {
+            Write-Verbose "Launcher process $LauncherProcessId is no longer queryable: $($_.Exception.Message)"
+        }
+        $candidates += @(Get-Process -Name $ExeBaseName -ErrorAction SilentlyContinue)
+
+        foreach ($candidate in ($candidates | Sort-Object Id -Unique)) {
+            try {
+                if ($candidate.HasExited) { continue }
+                $candidate.Refresh()
+                $handle = $candidate.MainWindowHandle
+                if ($handle -and $handle -ne [IntPtr]::Zero) {
+                    return [PSCustomObject]@{ Process = $candidate; Hwnd = $handle }
+                }
+            } catch {
+                Write-Verbose "Candidate process $($candidate.Id) exited while being inspected: $($_.Exception.Message)"
+            }
+        }
+        Start-Sleep -Milliseconds 300
+    }
+    return $null
+}
+
+# SendKeys with a per-character delay - sending a whole string at once can flood the input queue
+# faster than the browser processes it on a slow machine, dropping or reordering characters.
+function Send-KeysSlowly {
+    param([string]$Text, [int]$PerCharDelayMs = 40)
+    foreach ($ch in $Text.ToCharArray()) {
+        [System.Windows.Forms.SendKeys]::SendWait([string]$ch)
+        Start-Sleep -Milliseconds $PerCharDelayMs
+    }
+}
+
+# Types the URL into a new tab's address bar rather than passing it as a launch argument -
+# Chromium browsers ignore internal chrome://, edge://, brave:// URLs handed to an already-
+# running instance via the command line, but happily navigate to whatever's typed into the bar.
+function Invoke-BrowserNavigateToUrl {
+    param([System.Diagnostics.Process]$LauncherProcess, [string]$ExeBaseName, [string]$Url)
+    $d = $NavigationDelayMs
+
+    $window = Find-BrowserWindow -ExeBaseName $ExeBaseName -LauncherProcessId $LauncherProcess.Id -TimeoutSeconds ([Math]::Max(30, [int]($d / 40)))
+    if (-not $window) { throw "No $ExeBaseName window with a visible main window was found in time." }
+
+    if (-not (Set-ForegroundWindowRobust -Hwnd $window.Hwnd)) {
+        throw "Could not bring the browser window to the foreground - keystrokes would have gone nowhere."
+    }
+    Start-Sleep -Milliseconds $d
+
+    Set-ForegroundWindowRobust -Hwnd $window.Hwnd | Out-Null
+    [System.Windows.Forms.SendKeys]::SendWait('^t')
+    Start-Sleep -Milliseconds ($d * 2)
+
+    Set-ForegroundWindowRobust -Hwnd $window.Hwnd | Out-Null
+    [System.Windows.Forms.SendKeys]::SendWait('^l')
+    Start-Sleep -Milliseconds $d
+
+    Send-KeysSlowly -Text $Url -PerCharDelayMs ([Math]::Max(30, [int]($d / 20)))
+    Start-Sleep -Milliseconds $d
+    [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+    Start-Sleep -Milliseconds ($d * 2)
+}
+
 $passwordTargets = @(
-    @{ Browser = 'Chrome';  Exe = 'chrome';  Url = 'chrome://password-manager/passwords' }
-    @{ Browser = 'Edge';    Exe = 'msedge';  Url = 'edge://settings/passwords' }
-    @{ Browser = 'Opera';   Exe = 'opera';   Url = 'opera://settings/passwords' }
-    @{ Browser = 'Brave';   Exe = 'brave';   Url = 'brave://settings/passwords' }
-    @{ Browser = 'Vivaldi'; Exe = 'vivaldi'; Url = 'vivaldi://settings/passwords' }
-    @{ Browser = 'Firefox'; Exe = 'firefox'; Url = 'about:logins' }
+    @{ Browser = 'Chrome';  Exe = 'chrome.exe';  Url = 'chrome://password-manager/settings' }
+    @{ Browser = 'Edge';    Exe = 'msedge.exe';  Url = 'edge://settings/passwords' }
+    @{ Browser = 'Opera';   Exe = 'opera.exe';   Url = 'opera://settings/passwords' }
+    @{ Browser = 'Brave';   Exe = 'brave.exe';   Url = 'brave://settings/passwords' }
+    @{ Browser = 'Vivaldi'; Exe = 'vivaldi.exe'; Url = 'vivaldi://settings/passwords' }
+    @{ Browser = 'Firefox'; Exe = 'firefox.exe'; Url = 'about:logins' }
 )
 
 $passwordManifest = @()
 
 foreach ($target in $passwordTargets) {
-    $installed = (Get-Command $target.Exe -ErrorAction SilentlyContinue) -or
-                 ($chromiumRoots[$target.Browser] -and (Test-Path $chromiumRoots[$target.Browser]))
-    if (-not $installed) { continue }
-
-    $expectedFile = Join-Path $Dirs.Passwords "$($target.Browser)_Passwords.csv"
-    try {
-        Start-Process $target.Exe -ArgumentList $target.Url -ErrorAction Stop
-    } catch {
-        Write-Log "  -> Could not launch $($target.Browser): $($_.Exception.Message)"
+    $exePath = Get-BrowserExePath -ExeName $target.Exe
+    if (-not $exePath) {
+        Write-Log "  -> $($target.Browser) not detected on this machine, skipping."
         continue
     }
 
-    [System.Windows.Forms.MessageBox]::Show(
+    $expectedFile = Join-Path $Dirs.Passwords "$($target.Browser)_Passwords.csv"
+    $proc = $null
+    try {
+        $proc = Start-Process -FilePath $exePath -PassThru -ErrorAction Stop
+    } catch {
+        Write-Log "  -> Could not launch $($target.Browser) ($exePath): $($_.Exception.Message)"
+        continue
+    }
+
+    $navigated = $false
+    try {
+        $exeBaseName = $target.Exe -replace '\.exe$', ''
+        Invoke-BrowserNavigateToUrl -LauncherProcess $proc -ExeBaseName $exeBaseName -Url $target.Url
+        $navigated = $true
+        Write-Log "  -> $($target.Browser): navigated to $($target.Url)"
+    } catch {
+        Write-Log "  -> $($target.Browser): automatic navigation failed - browser is open, will need manual navigation. Detail: $($_.Exception.ToString())"
+    }
+
+    $message = if ($navigated) {
         "$($target.Browser) is now open to its saved-password page.`n`n" +
         "1. Click Export / Download passwords (you may need to re-enter the Windows login password).`n" +
         "2. Save the CSV file as exactly:`n   $expectedFile`n`n" +
-        "Click OK once the file has been saved.",
+        "Click OK once the file has been saved."
+    } else {
+        "$($target.Browser) is open, but couldn't be automatically navigated to its password page.`n`n" +
+        "1. In $($target.Browser), go to:`n   $($target.Url)`n" +
+        "2. Click Export / Download passwords (you may need to re-enter the Windows login password).`n" +
+        "3. Save the CSV file as exactly:`n   $expectedFile`n`n" +
+        "Click OK once the file has been saved."
+    }
+
+    [System.Windows.Forms.MessageBox]::Show(
+        $message,
         "Export $($target.Browser) Passwords",
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Information

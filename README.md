@@ -12,8 +12,8 @@ installed-apps list). It builds `Desktop\ITWin11Transfer\` containing:
 
 | Path | Contents |
 |---|---|
-| `Reports\InstalledApplications.csv` | Desktop apps from the uninstall registry (64-bit, 32-bit, per-user) |
-| `Reports\InstalledApps_UWP.csv` | Store/UWP apps |
+| `Reports\InstalledApplications.csv` | Names of desktop apps from the uninstall registry (64-bit, 32-bit, per-user) - name only |
+| `Reports\InstalledApps_UWP.csv` | Names of Store/UWP apps - name only |
 | `Reports\Printers.csv` | All installed printers |
 | `Reports\MappedDrives_FileServerShortcuts.csv` | SMB mappings, persistent drive letters, and Desktop/Documents `.lnk` shortcuts pointing at `\\server\share` |
 | `Reports\SharePointLibraries.csv` | OneDrive-synced SharePoint/Teams libraries + relevant Quick Access pins |
@@ -21,7 +21,7 @@ installed-apps list). It builds `Desktop\ITWin11Transfer\` containing:
 | `Reports\PasswordExportManifest.csv` | Which browsers' password exports were completed |
 | `TempDownloads\` | Mirror of the user's Downloads folder |
 | `TempBookmarks\` | Bookmarks JSON (Chromium browsers) / `places.sqlite` (Firefox) per profile |
-| `TempPasswords\` | CSV exports from each browser's **built-in** password exporter — the script opens each browser's export screen and waits for you to click through it (there's no CLI/API for this) |
+| `TempPasswords\` | CSV exports from each browser's **built-in** password exporter — the script opens each installed browser and types its password-settings URL into the address bar (typed, not passed as a launch argument, since Chromium ignores internal `chrome://`/`edge://` URLs handed to an already-running instance that way), then you click Export manually |
 | `TempOneNote\` | Any `.one` / `.onetoc2` files found under Documents, Desktop, OneDrive folders, and the OneNote local caches |
 
 Because everything lands under `Desktop\`, **OneDrive Known Folder Move
@@ -31,6 +31,14 @@ step required.
 **Security note:** `TempPasswords` contains plaintext credentials once
 exported. Delete it (see step 3 below) as soon as the Keeper import is
 confirmed.
+
+**Slow machine?** The address-bar navigation paces itself off `-NavigationDelayMs`
+(default `1200`). If a browser opens but the typed URL doesn't land correctly on an
+older/loaded machine, try a larger value:
+
+```powershell
+.\Export-Win11Transfer.ps1 -NavigationDelayMs 2500
+```
 
 ## 2. On the NEW PC: `Import-Win11Transfer.ps1`
 
